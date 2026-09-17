@@ -93,6 +93,9 @@ section[data-testid="stSidebar"] label p { font-size: 0.82rem; margin-bottom: 0.
 section[data-testid="stSidebar"] div[data-testid="stExpander"] details summary p {
     font-size: 0.86rem;
 }
+section[data-testid="stSidebar"] div[data-testid="stSlider"] {
+    padding-top: 1.0rem;
+}
 </style>
 """
 
@@ -284,40 +287,6 @@ historical_labels = be.sort_scenario_labels([l for l in all_labels if be.is_hist
 projection_labels = be.sort_scenario_labels([l for l in all_labels if not be.is_historical(l)])
 
 # --------------------------------------------------------------------------
-# Sidebar: year range
-# --------------------------------------------------------------------------
-# Bounded by the span of every loaded workbook, not of the currently selected
-# scenarios. That is what lets this control sit above the scenario choice:
-# its endpoints stay put when the mode changes, instead of the slider silently
-# rescaling itself in response to a control below it. The requested window is
-# intersected with the selected scenarios' own period further down.
-
-SPAN_MIN = min(sc.year_min for sc in scenarios.values())
-SPAN_MAX = max(sc.year_max for sc in scenarios.values())
-
-st.sidebar.subheader("\U0001F4C5 Year range")
-
-YEAR_KEY = "year_range"
-if SPAN_MAX > SPAN_MIN:
-    if YEAR_KEY not in st.session_state:
-        st.session_state[YEAR_KEY] = (SPAN_MIN, SPAN_MAX)
-    _lo, _hi = st.session_state[YEAR_KEY]
-    _lo = max(SPAN_MIN, min(int(_lo), SPAN_MAX))
-    _hi = min(SPAN_MAX, max(int(_hi), SPAN_MIN))
-    year_range = st.sidebar.slider(
-        "Years", min_value=SPAN_MIN, max_value=SPAN_MAX, value=(_lo, _hi),
-        label_visibility="collapsed",
-        help="Spans every loaded workbook. The window is clipped to the period the "
-             "selected scenarios actually cover.",
-    )
-    st.session_state[YEAR_KEY] = year_range
-else:
-    # A single-year dataset: a range slider cannot be built, and there is
-    # nothing to choose.
-    year_range = (SPAN_MIN, SPAN_MAX)
-    st.sidebar.caption(f"Single year in the data: {SPAN_MIN}.")
-
-# --------------------------------------------------------------------------
 # Sidebar: what to show - Historical, Projections, or both
 # --------------------------------------------------------------------------
 # One three-way choice replaces the earlier free-form multiselect, which
@@ -336,7 +305,7 @@ if historical_labels and projection_labels:
 st.sidebar.subheader("\U0001F5D3️ Select")
 scenario_mode = st.sidebar.radio(
     "Scenarios to show", options=modes,
-    index=modes.index(MODE_BOTH) if MODE_BOTH in modes else 0,
+    index=modes.index(MODE_HISTORICAL) if MODE_HISTORICAL in modes else 0,
     label_visibility="collapsed",
     help="Historical - the observed-forced run on its own.  Projections - the SSP runs "
          "only.  Historical + Projections - both on one panel, historical in black and "
@@ -373,6 +342,40 @@ primary = selected[selected_labels[0]]
 
 has_historical = any(be.is_historical(label) for label in selected_labels)
 historical_loaded = bool(historical_labels)
+
+# --------------------------------------------------------------------------
+# Sidebar: year range
+# --------------------------------------------------------------------------
+# Placed directly under the scenario choice so the slider always spans exactly
+# the period the selected run(s) cover: Historical shows the historical years,
+# Projections the projection years, and Historical + Projections the full
+# record. The endpoints rescale when the mode changes, and any stored window is
+# clamped back into the new bounds rather than left dangling.
+
+SPAN_MIN = min(sc.year_min for sc in selected.values())
+SPAN_MAX = max(sc.year_max for sc in selected.values())
+
+st.sidebar.subheader("\U0001F4C5 Year range")
+
+YEAR_KEY = "year_range"
+if SPAN_MAX > SPAN_MIN:
+    _stored = st.session_state.get(YEAR_KEY, (SPAN_MIN, SPAN_MAX))
+    _lo = max(SPAN_MIN, min(int(_stored[0]), SPAN_MAX))
+    _hi = min(SPAN_MAX, max(int(_stored[1]), SPAN_MIN))
+    if _hi < _lo:
+        _lo, _hi = SPAN_MIN, SPAN_MAX
+    year_range = st.sidebar.slider(
+        "Years", min_value=SPAN_MIN, max_value=SPAN_MAX, value=(_lo, _hi),
+        label_visibility="collapsed",
+        help="Spans the period the selected scenarios cover; it rescales when you "
+             "change the Historical / Projections choice above.",
+    )
+    st.session_state[YEAR_KEY] = year_range
+else:
+    # A single-year selection: a range slider cannot be built, and there is
+    # nothing to choose.
+    year_range = (SPAN_MIN, SPAN_MAX)
+    st.sidebar.caption(f"Single year in the data: {SPAN_MIN}.")
 
 # An indicator is only offered if every selected scenario carries it - a
 # half-drawn comparison (three scenarios plotted, one silently absent) is
