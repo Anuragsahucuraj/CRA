@@ -15,8 +15,11 @@ Data sources: upload the workbooks (one or more) and the mapping CSV via the
 sidebar, or place all of them next to this script - any .xlsx file in the
 same folder with a valid 'Metadata' sheet is picked up automatically.
 """
+import warnings
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
