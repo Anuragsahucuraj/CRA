@@ -22,6 +22,7 @@ and an "Other" category rather than failing.
 from __future__ import annotations
 
 import socket
+import contextlib
 from typing import Optional
 
 import numpy as np
@@ -38,11 +39,27 @@ except ImportError:
 
 # cartopy's feature downloader has no timeout of its own - on a firewalled or
 # slow connection, fetching Natural Earth data on first use can hang
-# indefinitely. Cap it so a network problem fails fast instead of freezing
-# the app; callers should also remember a failure for the rest of the
-# session (see app.py) rather than retrying every render.
+# indefinitely. IMPORTANT: this must be scoped to just the download calls via
+# the context manager below, NOT set globally with socket.setdefaulttimeout()
+# at import time - a process-wide default timeout also throttles every other
+# socket the host application opens, including the framework's own live
+# connection to the browser, which silently breaks the whole app (observed:
+# a permanently blank page with no Python exception, since nothing crashes -
+# a long-lived connection just never completes within the global timeout).
 CARTOPY_TIMEOUT_SEC = 8
-socket.setdefaulttimeout(CARTOPY_TIMEOUT_SEC)
+
+
+@contextlib.contextmanager
+def _scoped_socket_timeout(seconds: float):
+    """Temporarily set the default socket timeout, restoring whatever it was
+    before on exit - so this only affects sockets opened inside the `with`
+    block (cartopy's feature download), not the rest of the process."""
+    previous = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(seconds)
+    try:
+        yield
+    finally:
+        socket.setdefaulttimeout(previous)
 
 # (category, colormap) per indicator variable name
 INDICATOR_PRESENTATION = {
@@ -129,14 +146,15 @@ def style_basemap(ax, lon_bounds: tuple[float, float], lat_bounds: tuple[float, 
     """Apply the shared basemap styling to `ax`. Returns (used_cartopy, transform)."""
     if use_cartopy:
         try:
-            ax.set_extent([lon_bounds[0], lon_bounds[1], lat_bounds[0], lat_bounds[1]], crs=ccrs.PlateCarree())
-            ax.add_feature(cfeature.OCEAN, facecolor=BASEMAP_STYLE["ocean_color"], zorder=0)
-            ax.add_feature(cfeature.LAND, facecolor=BASEMAP_STYLE["land_color"], zorder=0)
-            ax.add_feature(cfeature.COASTLINE, linewidth=0.6, edgecolor=BASEMAP_STYLE["coastline_color"], zorder=1)
-            ax.add_feature(cfeature.BORDERS, linewidth=0.6, linestyle=":",
-                            edgecolor=BASEMAP_STYLE["border_color"], zorder=1)
-            gl = ax.gridlines(draw_labels=True, linewidth=0.3, color=BASEMAP_STYLE["gridline_color"], alpha=0.6)
-            gl.top_labels = gl.right_labels = False
+            with _scoped_socket_timeout(CARTOPY_TIMEOUT_SEC):
+                ax.set_extent([lon_bounds[0], lon_bounds[1], lat_bounds[0], lat_bounds[1]], crs=ccrs.PlateCarree())
+                ax.add_feature(cfeature.OCEAN, facecolor=BASEMAP_STYLE["ocean_color"], zorder=0)
+                ax.add_feature(cfeature.LAND, facecolor=BASEMAP_STYLE["land_color"], zorder=0)
+                ax.add_feature(cfeature.COASTLINE, linewidth=0.6, edgecolor=BASEMAP_STYLE["coastline_color"], zorder=1)
+                ax.add_feature(cfeature.BORDERS, linewidth=0.6, linestyle=":",
+                                edgecolor=BASEMAP_STYLE["border_color"], zorder=1)
+                gl = ax.gridlines(draw_labels=True, linewidth=0.3, color=BASEMAP_STYLE["gridline_color"], alpha=0.6)
+                gl.top_labels = gl.right_labels = False
             return True, ccrs.PlateCarree()
         except Exception:
             pass  # fall through to plain-axes styling; caller records the failure
