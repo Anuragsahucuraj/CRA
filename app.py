@@ -26,7 +26,7 @@ import streamlit as st
 import backend as be
 import viz
 
-st.set_page_config(page_title="Climate Risk Explorer", page_icon="\U0001F321\uFE0F", layout="wide")
+st.set_page_config(page_title="Climate Risk Explorer", page_icon="\U0001F321️", layout="wide")
 
 DEFAULT_CSV = Path("points_mapped.csv")
 SCRIPT_DIR = Path(__file__).parent if "__file__" in dir() else Path(".")
@@ -50,6 +50,43 @@ def _load_mapping_cached(file_bytes: bytes) -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def _build_grid_lookup_cached(data: pd.DataFrame) -> pd.DataFrame:
     return be.build_grid_lookup(data)
+
+
+# --------------------------------------------------------------------------
+# Figure layout helpers (not cached - these mutate the figure in place)
+# --------------------------------------------------------------------------
+
+def _positions_finite(fig) -> bool:
+    """True if every Axes in the figure has a finite position rectangle."""
+    return all(np.isfinite(ax.get_position().extents).all() for ax in fig.axes)
+
+
+def _apply_layout(fig, rect=(0.0, 0.0, 1.0, 0.97)) -> bool:
+    """tight_layout() that rolls itself back if it yields a non-finite geometry.
+
+    tight_layout() derives the subplot parameters from each Axes' tight bbox.
+    A single artist with a non-finite extent - a trend line or annotation
+    placed at NaN coordinates when an indicator is not computable at a grid
+    node, or a cartopy GeoAxes whose basemap data could not be fetched -
+    makes those parameters NaN. Matplotlib does not raise at that point; it
+    fails at draw time in MaxNLocator -> Axis.get_tick_space() with
+    "ValueError: cannot convert float NaN to integer".
+
+    Returns True if tight_layout was kept, False if the pre-layout geometry
+    was restored.
+    """
+    saved = [ax.get_position().frozen() for ax in fig.axes]
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # "Axes not compatible with tight_layout"
+            fig.tight_layout(rect=rect)
+    except Exception:
+        pass
+    if _positions_finite(fig):
+        return True
+    for ax, pos in zip(fig.axes, saved):
+        ax.set_position(pos)  # geometry from make_figure(), known finite
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -85,7 +122,7 @@ csv_bytes = csv_upload.getvalue() if csv_upload is not None else (
     DEFAULT_CSV.read_bytes() if DEFAULT_CSV.exists() else None)
 
 if not scenario_sources or csv_bytes is None:
-    st.title("\U0001F321\uFE0F Climate Risk Explorer")
+    st.title("\U0001F321️ Climate Risk Explorer")
     st.info("Upload at least one indicator workbook (.xlsx) and the district/state "
             "mapping (.csv) in the sidebar to continue - or place them next to "
             f"`app.py` (mapping file named `{DEFAULT_CSV.name}`).")
@@ -121,10 +158,10 @@ admin_lookup = mapped.set_index(["Latitude", "Longitude"])[
 # Header + scenario picker
 # --------------------------------------------------------------------------
 
-st.title("\U0001F321\uFE0F Climate Risk Explorer")
-st.markdown("Grid-point explorer for CMIP6-derived climate indicators across India (0.25\u00b0 resolution).")
+st.title("\U0001F321️ Climate Risk Explorer")
+st.markdown("Grid-point explorer for CMIP6-derived climate indicators across India (0.25° resolution).")
 
-scenario_label = st.sidebar.selectbox("\U0001F5D3\uFE0F Scenario", options=sorted(scenarios.keys()))
+scenario_label = st.sidebar.selectbox("\U0001F5D3️ Scenario", options=sorted(scenarios.keys()))
 sc = scenarios[scenario_label]
 data, run_metadata, indicator_metadata = sc.data, sc.run_metadata, sc.indicator_metadata
 INDICATOR_COLUMNS = sc.indicators
@@ -136,7 +173,7 @@ info_cols[1].metric("Period", f"{YEAR_MIN}-{YEAR_MAX}")
 info_cols[2].metric("Grid points", f"{data[['Latitude','Longitude']].drop_duplicates().shape[0]:,}")
 info_cols[3].metric("Source", run_metadata.get("Source Dataset", "-"))
 
-with st.expander("\u2139\uFE0F About this dataset"):
+with st.expander("ℹ️ About this dataset"):
     st.write(f"**Source dataset:** {run_metadata.get('Source Dataset', '-')}")
     st.write(f"**Spatial resolution:** {run_metadata.get('Spatial Resolution', '-')}")
     st.write(f"**Baseline for percentile indices:** {run_metadata.get('Baseline for Percentile Indices', '-')}")
@@ -146,7 +183,7 @@ with st.expander("\u2139\uFE0F About this dataset"):
         st.write("**All scenarios loaded:** " + ", ".join(sorted(scenarios.keys())))
     st.dataframe(
         pd.DataFrame(indicator_metadata).T[["Full Name", "Units", "Definition", "Calculation Method"]],
-        use_container_width=True,
+        width="stretch",
     )
 
 spacing_warning = be.check_grid_spacing(data)
@@ -206,7 +243,7 @@ with st.form(f"point_form::{scenario_label}"):
     )
 
     year_range = st.slider("Year range", min_value=YEAR_MIN, max_value=YEAR_MAX, value=saved["year_range"])
-    submitted = st.form_submit_button("\U0001F4CA Plot", type="primary", use_container_width=True)
+    submitted = st.form_submit_button("\U0001F4CA Plot", type="primary", width="stretch")
 
 if submitted:
     st.session_state[defaults_key] = dict(
@@ -274,10 +311,10 @@ if not _apply_layout(fig):
     st.caption("Note: automatic figure layout was skipped for this selection "
                "(non-finite element in the plot); using the default geometry.")
 st.pyplot(fig)
-plt.close(fig)
+plt.close(fig)  # Streamlit re-runs the whole script per interaction
 
 st.caption(f"**Definition:** {meta['Definition']}")
 st.caption(f"**Method:** {meta['Calculation Method']}")
 
 with st.expander("\U0001F4C4 Data table for this grid node"):
-    st.dataframe(ts.rename(columns={indicator: meta["Full Name"]}), use_container_width=True)
+    st.dataframe(ts.rename(columns={indicator: meta["Full Name"]}), width="stretch")
