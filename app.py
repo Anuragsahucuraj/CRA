@@ -6,11 +6,12 @@ Run with:  streamlit run app.py
 UI orchestration only - all data logic lives in backend.py, all rendering
 and indicator presentation (categories/colours/typography) lives in viz.py.
 
-Workflow: pick which scenarios to show (historical and/or the SSPs, together
-on one panel), type a Latitude/Longitude, pick an indicator (grouped by
-category), a year range and a chart type, click Plot. Shows the nearest actual
-grid node's District/State, the requested chart with an OLS trend, and a
-locator map.
+Workflow: every control sits in the left sidebar, top to bottom in the order
+you use them - upload the indicator workbooks, choose Historical /
+Projections / Historical + Projections, type a Latitude/Longitude, pick an
+indicator (grouped by category), a year range and a chart type, click Plot.
+The main panel is output only: the nearest actual grid node's District/State,
+the requested chart with an OLS trend, a locator map and the data table.
 
 Chart types
 -----------
@@ -51,6 +52,16 @@ SCRIPT_DIR = (Path(__file__).resolve().parent if "__file__" in dir()
 MAPPING_CSV = SCRIPT_DIR / "points_mapped.csv"
 
 PERIOD_LENGTHS = [5, 10, 20, 30]
+
+MODE_HISTORICAL = "Historical"
+MODE_PROJECTIONS = "Projections"
+MODE_BOTH = "Historical + Projections"
+
+# Opening grid node. Arbitrary but deliberate: a land node inside the domain,
+# so the app has something plottable on first load instead of an empty panel.
+# (28.625 N, 77.125 E is the Delhi cell.) Change these two numbers to open
+# somewhere else.
+DEFAULT_LAT, DEFAULT_LON = 28.625, 77.125
 
 
 # --------------------------------------------------------------------------
@@ -156,6 +167,13 @@ elif st.session_state.get("cartopy_unreachable", False):
     st.sidebar.warning("cartopy could not reach its basemap data this session (no internet, "
                         "or blocked by a firewall/proxy) - showing a plain scatter map instead.")
 
+# Per-scenario data-quality warnings belong with the data section, but they
+# cannot be computed until the scenario selection below is known. Reserving a
+# container here decouples the sidebar's visual order from the script's
+# execution order, so the warnings land under "Data files" rather than at the
+# very bottom of the sidebar.
+diagnostics_slot = st.sidebar.container()
+
 scenario_sources = {}  # source_name -> file bytes
 if xlsx_uploads:
     for f in xlsx_uploads:
@@ -217,22 +235,56 @@ admin_lookup = mapped.set_index(["Latitude", "Longitude"])[
 ]
 
 # --------------------------------------------------------------------------
-# Sidebar: scenario selection (historical + SSPs together)
+# Sidebar: what to show - Historical, Projections, or both
 # --------------------------------------------------------------------------
+# One three-way choice replaces the earlier free-form multiselect, which
+# defaulted to every loaded scenario at once and so always opened with all
+# four chips pre-selected. Modes are offered only where the loaded workbooks
+# can satisfy them, so the control can never ask for a run that is absent.
 
 all_labels = be.sort_scenario_labels(scenarios.keys())
+historical_labels = be.sort_scenario_labels([l for l in all_labels if be.is_historical(l)])
+projection_labels = be.sort_scenario_labels([l for l in all_labels if not be.is_historical(l)])
+
+modes = []
+if historical_labels:
+    modes.append(MODE_HISTORICAL)
+if projection_labels:
+    modes.append(MODE_PROJECTIONS)
+if historical_labels and projection_labels:
+    modes.append(MODE_BOTH)
 
 st.sidebar.divider()
-st.sidebar.header("\U0001F5D3️ Scenarios")
-selected_labels = st.sidebar.multiselect(
-    "Show together on one chart", options=all_labels, default=all_labels,
-    format_func=be.scenario_display_name,
-    help="Pick the historical run and any SSPs you want overlaid. Historical is "
-         "plotted in black and each SSP in its IPCC AR6 colour.",
+st.sidebar.header("\U0001F5D3️ Select")
+scenario_mode = st.sidebar.radio(
+    "Scenarios to show", options=modes,
+    index=modes.index(MODE_BOTH) if MODE_BOTH in modes else 0,
+    label_visibility="collapsed",
+    help="Historical - the observed-forced run on its own.  Projections - the SSP runs "
+         "only.  Historical + Projections - both on one panel, historical in black and "
+         "each SSP in its IPCC AR6 colour.",
 )
+
+if scenario_mode == MODE_HISTORICAL:
+    selected_labels = list(historical_labels)
+else:
+    chosen_projections = list(projection_labels)
+    if len(projection_labels) > 1:
+        # Kept so a single SSP can still be examined on its own; all of them
+        # are shown unless the user narrows the set here.
+        with st.sidebar.expander("Which projections?"):
+            chosen_projections = st.multiselect(
+                "SSP scenarios", options=projection_labels, default=projection_labels,
+                format_func=be.scenario_display_name, label_visibility="collapsed",
+                help="All loaded SSPs are shown by default. Deselect to compare fewer.",
+            )
+    selected_labels = ((list(historical_labels) if scenario_mode == MODE_BOTH else [])
+                       + list(chosen_projections))
+
 if not selected_labels:
     st.title("\U0001F321️ Climate Risk Explorer")
-    st.info("Select at least one scenario in the sidebar to continue.")
+    st.info("No scenario is selected - pick at least one SSP under 'Which projections?' "
+            "in the sidebar, or switch to Historical.")
     st.stop()
 
 selected_labels = be.sort_scenario_labels(selected_labels)
@@ -242,7 +294,7 @@ selected = {label: scenarios[label] for label in selected_labels}
 primary = selected[selected_labels[0]]
 
 has_historical = any(be.is_historical(label) for label in selected_labels)
-historical_loaded = any(be.is_historical(label) for label in scenarios)
+historical_loaded = bool(historical_labels)
 
 # An indicator is only offered if every selected scenario carries it - a
 # half-drawn comparison (three scenarios plotted, one silently absent) is
@@ -253,8 +305,8 @@ INDICATOR_COLUMNS = [k for k in primary.indicators if k in common_indicators]
 indicator_metadata = primary.indicator_metadata
 
 if not INDICATOR_COLUMNS:
-    st.error("The selected scenarios share no common indicator - deselect the "
-             "workbook with a different indicator set, or plot them one at a time.")
+    st.error("The selected scenarios share no common indicator - narrow the projection "
+             "set, or plot the scenarios one at a time.")
     st.stop()
 
 dropped = [k for sc in selected.values() for k in sc.indicators if k not in common_indicators]
@@ -264,6 +316,68 @@ if dropped:
 
 YEAR_MIN = min(sc.year_min for sc in selected.values())
 YEAR_MAX = max(sc.year_max for sc in selected.values())
+
+# --------------------------------------------------------------------------
+# Sidebar: grid point, indicator and year range
+# --------------------------------------------------------------------------
+# Placed here rather than in the main panel so that every input lives in one
+# column and the main panel is output only. It must follow the scenario
+# selection above, because the indicator list and the year bounds are derived
+# from the selected scenarios.
+
+indicator_groups = viz.group_indicators_by_category(INDICATOR_COLUMNS, indicator_metadata)
+
+# One control state across scenario selections, clamped to whatever is
+# currently valid - switching mode changes the available year span and
+# indicator set, and silently keeping an out-of-range saved value would either
+# crash the widget or plot a window the data does not cover.
+DEFAULTS_KEY = "point_controls"
+if DEFAULTS_KEY not in st.session_state:
+    first_category = next(iter(indicator_groups))
+    st.session_state[DEFAULTS_KEY] = dict(
+        lat=DEFAULT_LAT, lon=DEFAULT_LON, category=first_category,
+        indicator=indicator_groups[first_category][0], year_range=(YEAR_MIN, YEAR_MAX),
+    )
+saved = dict(st.session_state[DEFAULTS_KEY])
+if saved["category"] not in indicator_groups:
+    saved["category"] = next(iter(indicator_groups))
+if saved["indicator"] not in indicator_groups[saved["category"]]:
+    saved["indicator"] = indicator_groups[saved["category"]][0]
+lo_saved, hi_saved = saved["year_range"]
+saved["year_range"] = (max(YEAR_MIN, min(int(lo_saved), YEAR_MAX)),
+                       min(YEAR_MAX, max(int(hi_saved), YEAR_MIN)))
+
+st.sidebar.divider()
+st.sidebar.header("\U0001F4CD Select a grid point")
+
+# Stacked rather than in two columns: the sidebar is too narrow for a pair of
+# number_inputs with steppers without the labels wrapping.
+with st.sidebar.form("point_form"):
+    lat_in = st.number_input("Latitude", value=float(saved["lat"]), step=0.125, format="%.3f")
+    lon_in = st.number_input("Longitude", value=float(saved["lon"]), step=0.125, format="%.3f")
+
+    category = st.selectbox(
+        "Indicator category", options=list(indicator_groups.keys()),
+        index=list(indicator_groups.keys()).index(saved["category"]),
+    )
+    category_indicators = indicator_groups[category]
+    indicator = st.selectbox(
+        "Indicator", options=category_indicators,
+        index=category_indicators.index(saved["indicator"]) if saved["indicator"] in category_indicators else 0,
+        format_func=lambda k: f"{indicator_metadata[k]['Full Name']} [{indicator_metadata[k]['Units']}]",
+    )
+
+    year_range = st.slider("Year range", min_value=YEAR_MIN, max_value=YEAR_MAX,
+                           value=saved["year_range"])
+    submitted = st.form_submit_button("\U0001F4CA Plot", type="primary", width="stretch")
+
+if submitted:
+    saved = dict(lat=lat_in, lon=lon_in, category=category, indicator=indicator,
+                 year_range=year_range)
+st.session_state[DEFAULTS_KEY] = saved
+
+lat_in, lon_in, indicator = saved["lat"], saved["lon"], saved["indicator"]
+y0, y1 = saved["year_range"]
 
 # --------------------------------------------------------------------------
 # Sidebar: chart type and appearance
@@ -326,7 +440,8 @@ info_cols[2].metric(
     "Grid points",
     f"{primary.data[['Latitude', 'Longitude']].drop_duplicates().shape[0]:,}")
 info_cols[3].metric("Source", primary.run_metadata.get("Source Dataset", "-"))
-st.caption("Showing: " + ", ".join(be.scenario_display_name(l) for l in selected_labels))
+st.caption(f"Showing **{scenario_mode}**: "
+           + ", ".join(be.scenario_display_name(l) for l in selected_labels))
 
 with st.expander("ℹ️ About this dataset"):
     st.write(f"**Source dataset:** {primary.run_metadata.get('Source Dataset', '-')}")
@@ -348,11 +463,11 @@ for label in selected_labels:
     spacing_warning, n_missing = _scenario_diagnostics_cached(
         scenarios[label].source_name, scenarios[label].data, mapped)
     if spacing_warning:
-        st.sidebar.warning(f"[{be.scenario_display_name(label)}] {spacing_warning}")
+        diagnostics_slot.warning(f"[{be.scenario_display_name(label)}] {spacing_warning}")
     if n_missing:
-        st.sidebar.warning(f"[{be.scenario_display_name(label)}] {n_missing} grid points have no "
-                            f"entry in `{MAPPING_CSV.name}` - District/State will show as "
-                            "'Unknown' for these.")
+        diagnostics_slot.warning(f"[{be.scenario_display_name(label)}] {n_missing} grid points "
+                                 f"have no entry in `{MAPPING_CSV.name}` - District/State will "
+                                 "show as 'Unknown' for these.")
 
 grid_lookup = _build_grid_lookup_cached(primary.source_name, primary.data)
 LAT_BOUNDS = (min(sc.data["Latitude"].min() for sc in selected.values()) - 0.5,
@@ -367,64 +482,6 @@ def _note_cartopy_result(succeeded: bool):
     if use_cartopy and not succeeded:
         st.session_state["cartopy_unreachable"] = True
 
-
-# --------------------------------------------------------------------------
-# Controls
-# --------------------------------------------------------------------------
-
-st.divider()
-st.subheader("\U0001F4CD Select a grid point")
-
-indicator_groups = viz.group_indicators_by_category(INDICATOR_COLUMNS, indicator_metadata)
-
-# One control state across scenario selections, clamped to whatever is
-# currently valid - toggling a scenario changes the available year span and
-# indicator set, and silently keeping an out-of-range saved value would either
-# crash the widget or plot a window the data does not cover.
-DEFAULTS_KEY = "point_controls"
-if DEFAULTS_KEY not in st.session_state:
-    first_category = next(iter(indicator_groups))
-    st.session_state[DEFAULTS_KEY] = dict(
-        lat=28.625, lon=77.125, category=first_category,
-        indicator=indicator_groups[first_category][0], year_range=(YEAR_MIN, YEAR_MAX),
-    )
-saved = dict(st.session_state[DEFAULTS_KEY])
-if saved["category"] not in indicator_groups:
-    saved["category"] = next(iter(indicator_groups))
-if saved["indicator"] not in indicator_groups[saved["category"]]:
-    saved["indicator"] = indicator_groups[saved["category"]][0]
-lo_saved, hi_saved = saved["year_range"]
-saved["year_range"] = (max(YEAR_MIN, min(int(lo_saved), YEAR_MAX)),
-                       min(YEAR_MAX, max(int(hi_saved), YEAR_MIN)))
-
-with st.form("point_form"):
-    row1 = st.columns(2)
-    lat_in = row1[0].number_input("Latitude", value=float(saved["lat"]), step=0.125, format="%.3f")
-    lon_in = row1[1].number_input("Longitude", value=float(saved["lon"]), step=0.125, format="%.3f")
-
-    row2 = st.columns(2)
-    category = row2[0].selectbox(
-        "Indicator category", options=list(indicator_groups.keys()),
-        index=list(indicator_groups.keys()).index(saved["category"]),
-    )
-    category_indicators = indicator_groups[category]
-    indicator = row2[1].selectbox(
-        "Indicator", options=category_indicators,
-        index=category_indicators.index(saved["indicator"]) if saved["indicator"] in category_indicators else 0,
-        format_func=lambda k: f"{indicator_metadata[k]['Full Name']} [{indicator_metadata[k]['Units']}]",
-    )
-
-    year_range = st.slider("Year range", min_value=YEAR_MIN, max_value=YEAR_MAX,
-                           value=saved["year_range"])
-    submitted = st.form_submit_button("\U0001F4CA Plot", type="primary", width="stretch")
-
-if submitted:
-    saved = dict(lat=lat_in, lon=lon_in, category=category, indicator=indicator,
-                 year_range=year_range)
-st.session_state[DEFAULTS_KEY] = saved
-
-lat_in, lon_in, indicator = saved["lat"], saved["lon"], saved["indicator"]
-y0, y1 = saved["year_range"]
 
 if not (LAT_BOUNDS[0] <= lat_in <= LAT_BOUNDS[1] and LON_BOUNDS[0] <= lon_in <= LON_BOUNDS[1]):
     st.error(f"Input ({lat_in}, {lon_in}) is outside the dataset domain "
