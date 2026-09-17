@@ -184,12 +184,33 @@ def plot_point_locator(ax, grid_lats, grid_lons, lat_bounds, lon_bounds,
 
 
 def plot_point_timeseries(ax, years, values, units: str, full_name: str, subtitle: str, color: str = "#c0392b"):
-    """Yearly time series with an OLS trend line."""
-    ax.plot(years, values, marker="o", markersize=4, linewidth=1.4, color=color)
+    """Yearly time series with an OLS trend line. If every value is NaN (the
+    indicator is genuinely not computable at this location for the selected
+    period - e.g. a temperature threshold never reached), draws an explicit
+    placeholder with fixed axis limits instead of letting matplotlib
+    autoscale from all-NaN data: that autoscale is a known source of
+    version-dependent crashes (a NaN/Inf axis span reaching an integer
+    conversion deep in the tick locator), not something to just plot and
+    hope works."""
+    years = np.asarray(years)
+    values = np.asarray(values, dtype=float)
     valid = ~np.isnan(values)
+
+    if valid.sum() == 0:
+        ax.set_xlim(years.min() - 0.5, years.max() + 0.5) if len(years) else ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.text(0.5, 0.5, "No data for this indicator\nat this location/period",
+                transform=ax.transAxes, ha="center", va="center", fontsize=10, color="grey")
+        ax.set_xlabel("Year")
+        ax.set_title(f"{full_name}\n{subtitle}", fontsize=10)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        return
+
+    ax.plot(years, values, marker="o", markersize=4, linewidth=1.4, color=color)
     if valid.sum() >= 2:
-        slope, intercept = np.polyfit(np.asarray(years)[valid], np.asarray(values)[valid], 1)
-        trend = slope * np.asarray(years) + intercept
+        slope, intercept = np.polyfit(years[valid], values[valid], 1)
+        trend = slope * years + intercept
         ax.plot(years, trend, linestyle="--", color="grey", linewidth=1.1,
                 label=f"OLS trend: {slope * 10:+.3f} {units}/decade")
         ax.legend(fontsize=8)
