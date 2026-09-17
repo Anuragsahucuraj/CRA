@@ -269,8 +269,12 @@ viz.plot_point_timeseries(
 succeeded = viz.plot_point_locator(ax_map, grid_lookup["Latitude"].values, grid_lookup["Longitude"].values,
                                     LAT_BOUNDS, LON_BOUNDS, m.lat, m.lon, lat_in, lon_in, use_cartopy)
 _note_cartopy_result(succeeded)
-fig.tight_layout()
+
+if not _apply_layout(fig):
+    st.caption("Note: automatic figure layout was skipped for this selection "
+               "(non-finite element in the plot); using the default geometry.")
 st.pyplot(fig)
+plt.close(fig)
 
 st.caption(f"**Definition:** {meta['Definition']}")
 st.caption(f"**Method:** {meta['Calculation Method']}")
