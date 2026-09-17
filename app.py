@@ -7,9 +7,9 @@ UI orchestration only - all data logic lives in backend.py, all rendering
 and indicator presentation (categories/colours/typography) lives in viz.py.
 
 Workflow: every control sits in the left sidebar, top to bottom in the order
-you use them - upload the indicator workbooks, choose Historical /
-Projections / Historical + Projections, type a Latitude/Longitude, pick an
-indicator (grouped by category), a year range and a chart type, click Plot.
+you use them - upload the indicator workbooks, set the year range, choose
+Historical / Projections / Historical + Projections, type a Latitude/Longitude,
+pick an indicator (grouped by category), click Plot, then pick a chart type.
 The main panel is output only: the nearest actual grid node's District/State,
 the requested chart with an OLS trend, a locator map and the data table.
 
@@ -62,6 +62,39 @@ MODE_BOTH = "Historical + Projections"
 # (28.625 N, 77.125 E is the Delhi cell.) Change these two numbers to open
 # somewhere else.
 DEFAULT_LAT, DEFAULT_LON = 28.625, 77.125
+
+# Streamlit's stock sidebar spacing (1rem between blocks, ~6rem of top
+# padding, h2-sized section headers) makes five control groups overflow into a
+# scroll on a laptop screen. This trims the vertical rhythm only - no colours,
+# no widget restyling - and is scoped to the sidebar. It is cosmetic by
+# design: if these data-testid hooks are renamed in a future Streamlit the
+# rules simply stop matching and the sidebar reverts to the default spacing.
+SIDEBAR_CSS = """
+<style>
+section[data-testid="stSidebar"] div[data-testid="stSidebarUserContent"] {
+    padding-top: 1.1rem;
+}
+section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"] {
+    gap: 0.5rem;
+}
+section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3 {
+    font-size: 1.0rem;
+    margin: 0.35rem 0 0.05rem 0;
+    padding: 0;
+}
+section[data-testid="stSidebar"] hr { margin: 0.5rem 0; }
+section[data-testid="stSidebar"] div[data-testid="stCaptionContainer"] p {
+    font-size: 0.74rem;
+    line-height: 1.25;
+    margin-bottom: 0;
+}
+section[data-testid="stSidebar"] label p { font-size: 0.82rem; margin-bottom: 0.1rem; }
+section[data-testid="stSidebar"] div[data-testid="stExpander"] details summary p {
+    font-size: 0.86rem;
+}
+</style>
+"""
 
 
 # --------------------------------------------------------------------------
@@ -155,31 +188,41 @@ def _figure_png(fig) -> bytes:
 # Sidebar: data sources
 # --------------------------------------------------------------------------
 
-st.sidebar.header("\U0001F4C1 Data files")
-xlsx_uploads = st.sidebar.file_uploader(
-    "Indicator workbooks (.xlsx) - one per scenario", type=["xlsx"], accept_multiple_files=True)
-st.sidebar.caption(f"District/State mapping: `{MAPPING_CSV.name}` (bundled with the app).")
+st.markdown(SIDEBAR_CSS, unsafe_allow_html=True)
+
+# The uploader is the tallest widget in the sidebar and is needed only until
+# the workbooks are in, so it is folded away once they are. Auto-discovered
+# files are known before the widget is drawn; for uploads, the flag set at the
+# bottom of this section reports the previous run's outcome.
+_auto_xlsx = sorted(SCRIPT_DIR.glob("*.xlsx"))
+_data_ready = bool(_auto_xlsx) or st.session_state.get("workbooks_loaded", False)
+
+with st.sidebar.expander("\U0001F4C1 Data files", expanded=not _data_ready):
+    xlsx_uploads = st.file_uploader(
+        "Indicator workbooks (.xlsx) - one per scenario",
+        type=["xlsx"], accept_multiple_files=True)
+    st.caption(f"District/State mapping: `{MAPPING_CSV.name}` (bundled with the app).")
+
+# Advisory notices - basemap availability and per-scenario data-quality
+# warnings - collect here, directly under the data section. The container
+# decouples the sidebar's visual order from the script's execution order: the
+# diagnostics cannot be computed until the scenario selection below is known,
+# but they belong with the data, not at the foot of the sidebar.
+notices = st.sidebar.container()
 
 if not viz.HAVE_CARTOPY:
-    st.sidebar.warning("cartopy is not installed - the map will show a plain scatter "
-                        "with no coastlines/borders. `pip install cartopy` for the full basemap.")
+    notices.warning("cartopy is not installed - the map will show a plain scatter "
+                    "with no coastlines/borders. `pip install cartopy` for the full basemap.")
 elif st.session_state.get("cartopy_unreachable", False):
-    st.sidebar.warning("cartopy could not reach its basemap data this session (no internet, "
-                        "or blocked by a firewall/proxy) - showing a plain scatter map instead.")
-
-# Per-scenario data-quality warnings belong with the data section, but they
-# cannot be computed until the scenario selection below is known. Reserving a
-# container here decouples the sidebar's visual order from the script's
-# execution order, so the warnings land under "Data files" rather than at the
-# very bottom of the sidebar.
-diagnostics_slot = st.sidebar.container()
+    notices.warning("cartopy could not reach its basemap data this session (no internet, "
+                    "or blocked by a firewall/proxy) - showing a plain scatter map instead.")
 
 scenario_sources = {}  # source_name -> file bytes
 if xlsx_uploads:
     for f in xlsx_uploads:
         scenario_sources[f.name] = f.getvalue()
 else:
-    for path in sorted(SCRIPT_DIR.glob("*.xlsx")):
+    for path in _auto_xlsx:
         try:
             file_bytes = path.read_bytes()
             _parse_scenario_workbook_cached(file_bytes, path.name)  # cheap once cached; validates the file
@@ -220,8 +263,8 @@ for name, file_bytes in scenario_sources.items():
         sc = _parse_scenario_workbook_cached(file_bytes, name)
     except Exception as e:
         import traceback
-        st.sidebar.warning(f"Could not read '{name}' as an indicator workbook: {e}")
-        with st.sidebar.expander(f"Error detail: {name}"):
+        notices.warning(f"Could not read '{name}' as an indicator workbook: {e}")
+        with notices.expander(f"Error detail: {name}"):
             st.code(traceback.format_exc())
         continue
     scenarios[sc.label] = sc
@@ -230,9 +273,49 @@ if not scenarios:
     st.error("None of the uploaded/found .xlsx files could be parsed as an indicator workbook.")
     st.stop()
 
+st.session_state["workbooks_loaded"] = True
+
 admin_lookup = mapped.set_index(["Latitude", "Longitude"])[
     ["State", "District", "State_ID", "District_ID", "match"]
 ]
+
+all_labels = be.sort_scenario_labels(scenarios.keys())
+historical_labels = be.sort_scenario_labels([l for l in all_labels if be.is_historical(l)])
+projection_labels = be.sort_scenario_labels([l for l in all_labels if not be.is_historical(l)])
+
+# --------------------------------------------------------------------------
+# Sidebar: year range
+# --------------------------------------------------------------------------
+# Bounded by the span of every loaded workbook, not of the currently selected
+# scenarios. That is what lets this control sit above the scenario choice:
+# its endpoints stay put when the mode changes, instead of the slider silently
+# rescaling itself in response to a control below it. The requested window is
+# intersected with the selected scenarios' own period further down.
+
+SPAN_MIN = min(sc.year_min for sc in scenarios.values())
+SPAN_MAX = max(sc.year_max for sc in scenarios.values())
+
+st.sidebar.subheader("\U0001F4C5 Year range")
+
+YEAR_KEY = "year_range"
+if SPAN_MAX > SPAN_MIN:
+    if YEAR_KEY not in st.session_state:
+        st.session_state[YEAR_KEY] = (SPAN_MIN, SPAN_MAX)
+    _lo, _hi = st.session_state[YEAR_KEY]
+    _lo = max(SPAN_MIN, min(int(_lo), SPAN_MAX))
+    _hi = min(SPAN_MAX, max(int(_hi), SPAN_MIN))
+    year_range = st.sidebar.slider(
+        "Years", min_value=SPAN_MIN, max_value=SPAN_MAX, value=(_lo, _hi),
+        label_visibility="collapsed",
+        help="Spans every loaded workbook. The window is clipped to the period the "
+             "selected scenarios actually cover.",
+    )
+    st.session_state[YEAR_KEY] = year_range
+else:
+    # A single-year dataset: a range slider cannot be built, and there is
+    # nothing to choose.
+    year_range = (SPAN_MIN, SPAN_MAX)
+    st.sidebar.caption(f"Single year in the data: {SPAN_MIN}.")
 
 # --------------------------------------------------------------------------
 # Sidebar: what to show - Historical, Projections, or both
@@ -242,10 +325,6 @@ admin_lookup = mapped.set_index(["Latitude", "Longitude"])[
 # four chips pre-selected. Modes are offered only where the loaded workbooks
 # can satisfy them, so the control can never ask for a run that is absent.
 
-all_labels = be.sort_scenario_labels(scenarios.keys())
-historical_labels = be.sort_scenario_labels([l for l in all_labels if be.is_historical(l)])
-projection_labels = be.sort_scenario_labels([l for l in all_labels if not be.is_historical(l)])
-
 modes = []
 if historical_labels:
     modes.append(MODE_HISTORICAL)
@@ -254,8 +333,7 @@ if projection_labels:
 if historical_labels and projection_labels:
     modes.append(MODE_BOTH)
 
-st.sidebar.divider()
-st.sidebar.header("\U0001F5D3️ Select")
+st.sidebar.subheader("\U0001F5D3️ Select")
 scenario_mode = st.sidebar.radio(
     "Scenarios to show", options=modes,
     index=modes.index(MODE_BOTH) if MODE_BOTH in modes else 0,
@@ -311,50 +389,57 @@ if not INDICATOR_COLUMNS:
 
 dropped = [k for sc in selected.values() for k in sc.indicators if k not in common_indicators]
 if dropped:
-    st.sidebar.caption(f"{len(set(dropped))} indicator(s) are not present in every selected "
-                       "scenario and are hidden from the picker.")
+    st.sidebar.caption(f"{len(set(dropped))} indicator(s) missing from one or more selected "
+                       "scenarios are hidden from the picker.")
 
 YEAR_MIN = min(sc.year_min for sc in selected.values())
 YEAR_MAX = max(sc.year_max for sc in selected.values())
 
+# The requested window, clipped to what the selected scenarios cover, so that
+# the figure title and the CSV filename state the period actually plotted
+# rather than the slider's endpoints.
+y0, y1 = max(year_range[0], YEAR_MIN), min(year_range[1], YEAR_MAX)
+if y1 < y0:
+    st.title("\U0001F321️ Climate Risk Explorer")
+    st.info(f"The selected year range ({year_range[0]}-{year_range[1]}) does not overlap "
+            f"the period covered by **{scenario_mode}** ({YEAR_MIN}-{YEAR_MAX}). Widen the "
+            "year range or change the scenario selection.")
+    st.stop()
+
 # --------------------------------------------------------------------------
-# Sidebar: grid point, indicator and year range
+# Sidebar: grid point and indicator
 # --------------------------------------------------------------------------
-# Placed here rather than in the main panel so that every input lives in one
+# In the sidebar rather than the main panel so that every input lives in one
 # column and the main panel is output only. It must follow the scenario
-# selection above, because the indicator list and the year bounds are derived
-# from the selected scenarios.
+# selection above, because the indicator list is derived from the selected
+# scenarios.
 
 indicator_groups = viz.group_indicators_by_category(INDICATOR_COLUMNS, indicator_metadata)
 
 # One control state across scenario selections, clamped to whatever is
-# currently valid - switching mode changes the available year span and
-# indicator set, and silently keeping an out-of-range saved value would either
-# crash the widget or plot a window the data does not cover.
+# currently valid - switching mode changes the indicator set, and silently
+# keeping a value that is no longer offered would crash the widget.
 DEFAULTS_KEY = "point_controls"
 if DEFAULTS_KEY not in st.session_state:
     first_category = next(iter(indicator_groups))
     st.session_state[DEFAULTS_KEY] = dict(
         lat=DEFAULT_LAT, lon=DEFAULT_LON, category=first_category,
-        indicator=indicator_groups[first_category][0], year_range=(YEAR_MIN, YEAR_MAX),
+        indicator=indicator_groups[first_category][0],
     )
 saved = dict(st.session_state[DEFAULTS_KEY])
 if saved["category"] not in indicator_groups:
     saved["category"] = next(iter(indicator_groups))
 if saved["indicator"] not in indicator_groups[saved["category"]]:
     saved["indicator"] = indicator_groups[saved["category"]][0]
-lo_saved, hi_saved = saved["year_range"]
-saved["year_range"] = (max(YEAR_MIN, min(int(lo_saved), YEAR_MAX)),
-                       min(YEAR_MAX, max(int(hi_saved), YEAR_MIN)))
 
-st.sidebar.divider()
-st.sidebar.header("\U0001F4CD Select a grid point")
+st.sidebar.subheader("\U0001F4CD Grid point")
 
-# Stacked rather than in two columns: the sidebar is too narrow for a pair of
-# number_inputs with steppers without the labels wrapping.
 with st.sidebar.form("point_form"):
-    lat_in = st.number_input("Latitude", value=float(saved["lat"]), step=0.125, format="%.3f")
-    lon_in = st.number_input("Longitude", value=float(saved["lon"]), step=0.125, format="%.3f")
+    # Two columns: the pair of coordinates is the one place in the sidebar
+    # where side-by-side fields still read cleanly, and it saves a row.
+    coords = st.columns(2)
+    lat_in = coords[0].number_input("Lat", value=float(saved["lat"]), step=0.125, format="%.3f")
+    lon_in = coords[1].number_input("Lon", value=float(saved["lon"]), step=0.125, format="%.3f")
 
     category = st.selectbox(
         "Indicator category", options=list(indicator_groups.keys()),
@@ -366,18 +451,13 @@ with st.sidebar.form("point_form"):
         index=category_indicators.index(saved["indicator"]) if saved["indicator"] in category_indicators else 0,
         format_func=lambda k: f"{indicator_metadata[k]['Full Name']} [{indicator_metadata[k]['Units']}]",
     )
-
-    year_range = st.slider("Year range", min_value=YEAR_MIN, max_value=YEAR_MAX,
-                           value=saved["year_range"])
     submitted = st.form_submit_button("\U0001F4CA Plot", type="primary", width="stretch")
 
 if submitted:
-    saved = dict(lat=lat_in, lon=lon_in, category=category, indicator=indicator,
-                 year_range=year_range)
+    saved = dict(lat=lat_in, lon=lon_in, category=category, indicator=indicator)
 st.session_state[DEFAULTS_KEY] = saved
 
 lat_in, lon_in, indicator = saved["lat"], saved["lon"], saved["indicator"]
-y0, y1 = saved["year_range"]
 
 # --------------------------------------------------------------------------
 # Sidebar: chart type and appearance
@@ -388,9 +468,9 @@ y0, y1 = saved["year_range"]
 # length, anomaly mode) until after a second submit. Out here, changing the
 # chart type re-renders immediately from the already-chosen grid point.
 
-st.sidebar.divider()
-st.sidebar.header("\U0001F4C8 Chart")
-chart_type = st.sidebar.radio("Chart type", options=viz.CHART_TYPES, index=0)
+st.sidebar.subheader("\U0001F4C8 Chart")
+chart_type = st.sidebar.radio("Chart type", options=viz.CHART_TYPES, index=0,
+                              label_visibility="collapsed")
 
 show_trend = True
 period_len = 10
@@ -417,14 +497,13 @@ elif chart_type in (viz.CHART_BARS_PERIOD, viz.CHART_BARS_ANOMALY):
             format_func=lambda m: "Absolute (indicator units)" if m == "absolute" else "Per cent of baseline",
         )
 
-st.sidebar.divider()
-st.sidebar.header("\U0001F58B️ Appearance")
-text_scale = st.sidebar.select_slider(
-    "Chart text size", options=list(viz.TEXT_SCALES.keys()), value=viz.DEFAULT_TEXT_SCALE,
-    help="Sets every text size in the figure from one base size (ticks, axis labels, "
-         "legend, titles) and matches the canvas size to it, so labels stay legible "
-         "instead of being shrunk by the browser's rescaling.",
-)
+with st.sidebar.expander("\U0001F58B️ Appearance"):
+    text_scale = st.select_slider(
+        "Chart text size", options=list(viz.TEXT_SCALES.keys()), value=viz.DEFAULT_TEXT_SCALE,
+        help="Sets every text size in the figure from one base size (ticks, axis labels, "
+             "legend, titles) and matches the canvas size to it, so labels stay legible "
+             "instead of being shrunk by the browser's rescaling.",
+    )
 
 # --------------------------------------------------------------------------
 # Header
@@ -442,6 +521,9 @@ info_cols[2].metric(
 info_cols[3].metric("Source", primary.run_metadata.get("Source Dataset", "-"))
 st.caption(f"Showing **{scenario_mode}**: "
            + ", ".join(be.scenario_display_name(l) for l in selected_labels))
+if (y0, y1) != (year_range[0], year_range[1]):
+    st.caption(f"Year range clipped from {year_range[0]}-{year_range[1]} to {y0}-{y1}, "
+               "the period the selected scenarios cover.")
 
 with st.expander("ℹ️ About this dataset"):
     st.write(f"**Source dataset:** {primary.run_metadata.get('Source Dataset', '-')}")
@@ -463,11 +545,11 @@ for label in selected_labels:
     spacing_warning, n_missing = _scenario_diagnostics_cached(
         scenarios[label].source_name, scenarios[label].data, mapped)
     if spacing_warning:
-        diagnostics_slot.warning(f"[{be.scenario_display_name(label)}] {spacing_warning}")
+        notices.warning(f"[{be.scenario_display_name(label)}] {spacing_warning}")
     if n_missing:
-        diagnostics_slot.warning(f"[{be.scenario_display_name(label)}] {n_missing} grid points "
-                                 f"have no entry in `{MAPPING_CSV.name}` - District/State will "
-                                 "show as 'Unknown' for these.")
+        notices.warning(f"[{be.scenario_display_name(label)}] {n_missing} grid points have no "
+                        f"entry in `{MAPPING_CSV.name}` - District/State will show as "
+                        "'Unknown' for these.")
 
 grid_lookup = _build_grid_lookup_cached(primary.source_name, primary.data)
 LAT_BOUNDS = (min(sc.data["Latitude"].min() for sc in selected.values()) - 0.5,
