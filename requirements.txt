@@ -3,3 +3,4 @@ pandas
 openpyxl
 matplotlib 
 cartopy
+from map_panel import snap_to_grid, render_location_map
