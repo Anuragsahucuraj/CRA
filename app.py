@@ -23,9 +23,11 @@ Chart types
   Bars - change vs baseline      period means as a change from the historical
                                 reference period, absolute or per cent
 
-Data sources: upload the workbooks (one or more) and the mapping CSV via the
-sidebar, or place all of them next to this script - any .xlsx file in the
-same folder with a valid 'Metadata' sheet is picked up automatically.
+Data sources: the district/state mapping (`points_mapped.csv`) ships with the
+app and is read from the script's own folder at startup - it is not uploaded.
+Indicator workbooks are uploaded (one or more) via the sidebar, or placed next
+to this script - any .xlsx file in the same folder with a valid 'Metadata'
+sheet is picked up automatically.
 """
 import io
 import warnings
@@ -41,8 +43,12 @@ import viz
 
 st.set_page_config(page_title="Climate Risk Explorer", page_icon="\U0001F321️", layout="wide")
 
-DEFAULT_CSV = Path("points_mapped.csv")
-SCRIPT_DIR = Path(__file__).parent if "__file__" in dir() else Path(".")
+# Resolved against the script's own folder rather than the process working
+# directory: `streamlit run` is often launched from elsewhere, and on Streamlit
+# Community Cloud the cwd is the repo root, which need not be where app.py sits.
+SCRIPT_DIR = (Path(__file__).resolve().parent if "__file__" in dir()
+              else Path(".").resolve())
+MAPPING_CSV = SCRIPT_DIR / "points_mapped.csv"
 
 PERIOD_LENGTHS = [5, 10, 20, 30]
 
@@ -58,8 +64,15 @@ def _parse_scenario_workbook_cached(file_bytes: bytes, source_name: str):
 
 
 @st.cache_data(show_spinner="Loading district/state mapping...")
-def _load_mapping_cached(file_bytes: bytes) -> pd.DataFrame:
-    return be.load_mapping(file_bytes)
+def _load_mapping_cached(path_str: str, _mtime_ns: int, _size: int) -> pd.DataFrame:
+    """Parse the bundled district/state mapping CSV.
+
+    Keyed on (path, mtime, size) rather than the file's contents: the file
+    ships with the app, so re-hashing it on every rerun is pure overhead,
+    while the mtime/size pair still invalidates the cache if the bundled
+    file is replaced by a re-deployment.
+    """
+    return be.load_mapping(Path(path_str).read_bytes())
 
 
 # The leading-underscore arguments below are excluded from Streamlit's cache
@@ -134,7 +147,7 @@ def _figure_png(fig) -> bytes:
 st.sidebar.header("\U0001F4C1 Data files")
 xlsx_uploads = st.sidebar.file_uploader(
     "Indicator workbooks (.xlsx) - one per scenario", type=["xlsx"], accept_multiple_files=True)
-csv_upload = st.sidebar.file_uploader("District/State mapping (.csv)", type=["csv"])
+st.sidebar.caption(f"District/State mapping: `{MAPPING_CSV.name}` (bundled with the app).")
 
 if not viz.HAVE_CARTOPY:
     st.sidebar.warning("cartopy is not installed - the map will show a plain scatter "
@@ -156,14 +169,31 @@ else:
         except Exception:
             continue  # not one of our workbooks (or unreadable) - skip silently in auto-discovery
 
-csv_bytes = csv_upload.getvalue() if csv_upload is not None else (
-    DEFAULT_CSV.read_bytes() if DEFAULT_CSV.exists() else None)
-
-if not scenario_sources or csv_bytes is None:
+# The mapping is part of the deployment, so a missing or unreadable file is a
+# packaging fault, not something the user can fix in the UI - say so plainly and
+# stop here rather than surfacing a traceback further down.
+if not MAPPING_CSV.exists():
     st.title("\U0001F321️ Climate Risk Explorer")
-    st.info("Upload at least one indicator workbook (.xlsx) and the district/state "
-            "mapping (.csv) in the sidebar to continue - or place them next to "
-            f"`app.py` (mapping file named `{DEFAULT_CSV.name}`).")
+    st.error(f"The district/state mapping file `{MAPPING_CSV.name}` is missing from this "
+             "deployment. It is expected to sit next to `app.py`; re-deploy with the "
+             "file included. District/State attribution cannot be done without it.")
+    st.stop()
+
+try:
+    _mapping_stat = MAPPING_CSV.stat()
+    mapped = _load_mapping_cached(str(MAPPING_CSV), _mapping_stat.st_mtime_ns,
+                                  _mapping_stat.st_size)
+except Exception as e:
+    st.title("\U0001F321️ Climate Risk Explorer")
+    st.error(f"The bundled district/state mapping file `{MAPPING_CSV.name}` could not be "
+             f"read: {e}. Expected columns: Latitude, Longitude, DIST_LGD, DISTRICT, "
+             "STATE_LGD, STATE_UT, match.")
+    st.stop()
+
+if not scenario_sources:
+    st.title("\U0001F321️ Climate Risk Explorer")
+    st.info("Upload at least one indicator workbook (.xlsx) in the sidebar to continue - "
+            "or place the workbooks next to `app.py`.")
     st.stop()
 
 scenarios = {}
@@ -180,12 +210,6 @@ for name, file_bytes in scenario_sources.items():
 
 if not scenarios:
     st.error("None of the uploaded/found .xlsx files could be parsed as an indicator workbook.")
-    st.stop()
-
-try:
-    mapped = _load_mapping_cached(csv_bytes)
-except Exception as e:
-    st.error(f"Could not read the district/state mapping CSV: {e}")
     st.stop()
 
 admin_lookup = mapped.set_index(["Latitude", "Longitude"])[
@@ -327,8 +351,8 @@ for label in selected_labels:
         st.sidebar.warning(f"[{be.scenario_display_name(label)}] {spacing_warning}")
     if n_missing:
         st.sidebar.warning(f"[{be.scenario_display_name(label)}] {n_missing} grid points have no "
-                            "entry in the mapping file - District/State will show as 'Unknown' "
-                            "for these.")
+                            f"entry in `{MAPPING_CSV.name}` - District/State will show as "
+                            "'Unknown' for these.")
 
 grid_lookup = _build_grid_lookup_cached(primary.source_name, primary.data)
 LAT_BOUNDS = (min(sc.data["Latitude"].min() for sc in selected.values()) - 0.5,
@@ -434,7 +458,7 @@ if m.admin_match == "overlap":
     st.info("This grid node's District/State was assigned by a nearest-district fallback "
             "(coastal/border cell) rather than an exact point-in-polygon match.")
 elif m.admin_match == "Unknown":
-    st.warning("This grid node has no entry in the mapping file - District/State "
+    st.warning(f"This grid node has no entry in `{MAPPING_CSV.name}` - District/State "
                "attribution is unavailable for it.")
 
 # --------------------------------------------------------------------------
