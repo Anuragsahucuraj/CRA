@@ -4,17 +4,30 @@ app.py - Climate Risk Explorer (Grid Point mode), Streamlit frontend
 Run with:  streamlit run app.py
 
 UI orchestration only - all data logic lives in backend.py, all rendering
-and indicator presentation (categories/colours) lives in viz.py.
+and indicator presentation (categories/colours/typography) lives in viz.py.
 
-Workflow: pick a Scenario, type a Latitude/Longitude, pick an indicator
-(grouped by category) and a year range, click Plot. Shows the nearest
-actual grid node's District/State, its yearly time series with an OLS
-trend, and a locator map.
+Workflow: pick which scenarios to show (historical and/or the SSPs, together
+on one panel), type a Latitude/Longitude, pick an indicator (grouped by
+category), a year range and a chart type, click Plot. Shows the nearest actual
+grid node's District/State, the requested chart with an OLS trend, and a
+locator map.
+
+Chart types
+-----------
+  Line - annual time series     one line per scenario, trend fitted per
+                                scenario over its own years
+  Bars - annual                 year-by-year bars, grouped only where two
+                                scenarios share a year
+  Bars - period means           calendar-aligned period means (5/10/20/30 yr)
+                                with +/- 1 s.d. interannual variability
+  Bars - change vs baseline      period means as a change from the historical
+                                reference period, absolute or per cent
 
 Data sources: upload the workbooks (one or more) and the mapping CSV via the
 sidebar, or place all of them next to this script - any .xlsx file in the
 same folder with a valid 'Metadata' sheet is picked up automatically.
 """
+import io
 import warnings
 from pathlib import Path
 
@@ -30,6 +43,8 @@ st.set_page_config(page_title="Climate Risk Explorer", page_icon="\U0001F321️"
 
 DEFAULT_CSV = Path("points_mapped.csv")
 SCRIPT_DIR = Path(__file__).parent if "__file__" in dir() else Path(".")
+
+PERIOD_LENGTHS = [5, 10, 20, 30]
 
 
 # --------------------------------------------------------------------------
@@ -47,9 +62,22 @@ def _load_mapping_cached(file_bytes: bytes) -> pd.DataFrame:
     return be.load_mapping(file_bytes)
 
 
+# The leading-underscore arguments below are excluded from Streamlit's cache
+# key by design: the workbook's source_name already identifies its contents
+# (the parsed frame is itself cached against the file bytes), so hashing a
+# ~100k-row DataFrame on every rerun - once per loaded scenario - is pure
+# overhead. Keying on the name instead keeps the cache correct and cheap.
+
 @st.cache_data(show_spinner=False)
-def _build_grid_lookup_cached(data: pd.DataFrame) -> pd.DataFrame:
-    return be.build_grid_lookup(data)
+def _build_grid_lookup_cached(source_name: str, _data: pd.DataFrame) -> pd.DataFrame:
+    return be.build_grid_lookup(_data)
+
+
+@st.cache_data(show_spinner=False)
+def _scenario_diagnostics_cached(source_name: str, _data: pd.DataFrame,
+                                  _mapped: pd.DataFrame) -> tuple:
+    """(grid-spacing warning or None, count of unmapped grid points)."""
+    return be.check_grid_spacing(_data), be.coverage_gap(_data, _mapped)
 
 
 # --------------------------------------------------------------------------
@@ -61,7 +89,7 @@ def _positions_finite(fig) -> bool:
     return all(np.isfinite(ax.get_position().extents).all() for ax in fig.axes)
 
 
-def _apply_layout(fig, rect=(0.0, 0.0, 1.0, 0.97)) -> bool:
+def _apply_layout(fig, rect=(0.0, 0.0, 1.0, 0.93)) -> bool:
     """tight_layout() that rolls itself back if it yields a non-finite geometry.
 
     tight_layout() derives the subplot parameters from each Axes' tight bbox.
@@ -71,6 +99,9 @@ def _apply_layout(fig, rect=(0.0, 0.0, 1.0, 0.97)) -> bool:
     makes those parameters NaN. Matplotlib does not raise at that point; it
     fails at draw time in MaxNLocator -> Axis.get_tick_space() with
     "ValueError: cannot convert float NaN to integer".
+
+    The default rect leaves the top strip free for the figure-level title
+    (location and period), so it never collides with the panel titles.
 
     Returns True if tight_layout was kept, False if the pre-layout geometry
     was restored.
@@ -87,6 +118,13 @@ def _apply_layout(fig, rect=(0.0, 0.0, 1.0, 0.97)) -> bool:
     for ax, pos in zip(fig.axes, saved):
         ax.set_position(pos)  # geometry from make_figure(), known finite
     return False
+
+
+def _figure_png(fig) -> bytes:
+    """Publication-resolution PNG of the current figure, for download."""
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=300, bbox_inches="tight", facecolor="white")
+    return buf.getvalue()
 
 
 # --------------------------------------------------------------------------
@@ -155,49 +193,148 @@ admin_lookup = mapped.set_index(["Latitude", "Longitude"])[
 ]
 
 # --------------------------------------------------------------------------
-# Header + scenario picker
+# Sidebar: scenario selection (historical + SSPs together)
+# --------------------------------------------------------------------------
+
+all_labels = be.sort_scenario_labels(scenarios.keys())
+
+st.sidebar.divider()
+st.sidebar.header("\U0001F5D3️ Scenarios")
+selected_labels = st.sidebar.multiselect(
+    "Show together on one chart", options=all_labels, default=all_labels,
+    format_func=be.scenario_display_name,
+    help="Pick the historical run and any SSPs you want overlaid. Historical is "
+         "plotted in black and each SSP in its IPCC AR6 colour.",
+)
+if not selected_labels:
+    st.title("\U0001F321️ Climate Risk Explorer")
+    st.info("Select at least one scenario in the sidebar to continue.")
+    st.stop()
+
+selected_labels = be.sort_scenario_labels(selected_labels)
+selected = {label: scenarios[label] for label in selected_labels}
+# The historical run is the natural reference for metadata and for the grid,
+# so it leads when it is on screen; otherwise the lowest-forcing SSP does.
+primary = selected[selected_labels[0]]
+
+has_historical = any(be.is_historical(label) for label in selected_labels)
+historical_loaded = any(be.is_historical(label) for label in scenarios)
+
+# An indicator is only offered if every selected scenario carries it - a
+# half-drawn comparison (three scenarios plotted, one silently absent) is
+# worse than not offering the indicator. Order and metadata come from the
+# primary scenario so the picker does not reshuffle as scenarios are toggled.
+common_indicators = set.intersection(*[set(sc.indicators) for sc in selected.values()])
+INDICATOR_COLUMNS = [k for k in primary.indicators if k in common_indicators]
+indicator_metadata = primary.indicator_metadata
+
+if not INDICATOR_COLUMNS:
+    st.error("The selected scenarios share no common indicator - deselect the "
+             "workbook with a different indicator set, or plot them one at a time.")
+    st.stop()
+
+dropped = [k for sc in selected.values() for k in sc.indicators if k not in common_indicators]
+if dropped:
+    st.sidebar.caption(f"{len(set(dropped))} indicator(s) are not present in every selected "
+                       "scenario and are hidden from the picker.")
+
+YEAR_MIN = min(sc.year_min for sc in selected.values())
+YEAR_MAX = max(sc.year_max for sc in selected.values())
+
+# --------------------------------------------------------------------------
+# Sidebar: chart type and appearance
+# --------------------------------------------------------------------------
+# These live outside the form on purpose. Widgets inside a Streamlit form do
+# not rerun the script until the form is submitted, so a chart-type switch
+# placed there would not be able to reveal its own dependent options (period
+# length, anomaly mode) until after a second submit. Out here, changing the
+# chart type re-renders immediately from the already-chosen grid point.
+
+st.sidebar.divider()
+st.sidebar.header("\U0001F4C8 Chart")
+chart_type = st.sidebar.radio("Chart type", options=viz.CHART_TYPES, index=0)
+
+show_trend = True
+period_len = 10
+show_spread = True
+anomaly_mode = "absolute"
+
+if chart_type == viz.CHART_LINE:
+    show_trend = st.sidebar.checkbox("Show OLS trend per scenario", value=True)
+elif chart_type in (viz.CHART_BARS_PERIOD, viz.CHART_BARS_ANOMALY):
+    period_len = st.sidebar.selectbox(
+        "Averaging period (years)", options=PERIOD_LENGTHS, index=PERIOD_LENGTHS.index(10),
+        help="Periods are anchored to calendar boundaries (1990-1999, 2000-2009, ...) "
+             "so the same bar stays comparable between sessions and scenarios.",
+    )
+    if chart_type == viz.CHART_BARS_PERIOD:
+        show_spread = st.sidebar.checkbox(
+            "Show interannual spread (+/- 1 s.d.)", value=True,
+            help="Standard deviation of the annual values within each period. "
+                 "This is interannual variability, not model uncertainty.",
+        )
+    else:
+        anomaly_mode = st.sidebar.radio(
+            "Express change as", options=["absolute", "percent"], index=0,
+            format_func=lambda m: "Absolute (indicator units)" if m == "absolute" else "Per cent of baseline",
+        )
+
+st.sidebar.divider()
+st.sidebar.header("\U0001F58B️ Appearance")
+text_scale = st.sidebar.select_slider(
+    "Chart text size", options=list(viz.TEXT_SCALES.keys()), value=viz.DEFAULT_TEXT_SCALE,
+    help="Sets every text size in the figure from one base size (ticks, axis labels, "
+         "legend, titles) and matches the canvas size to it, so labels stay legible "
+         "instead of being shrunk by the browser's rescaling.",
+)
+
+# --------------------------------------------------------------------------
+# Header
 # --------------------------------------------------------------------------
 
 st.title("\U0001F321️ Climate Risk Explorer")
 st.markdown("Grid-point explorer for CMIP6-derived climate indicators across India (0.25° resolution).")
 
-scenario_label = st.sidebar.selectbox("\U0001F5D3️ Scenario", options=sorted(scenarios.keys()))
-sc = scenarios[scenario_label]
-data, run_metadata, indicator_metadata = sc.data, sc.run_metadata, sc.indicator_metadata
-INDICATOR_COLUMNS = sc.indicators
-YEAR_MIN, YEAR_MAX = sc.year_min, sc.year_max
-
 info_cols = st.columns(4)
-info_cols[0].metric("Scenario", scenario_label.split(" (")[0])
-info_cols[1].metric("Period", f"{YEAR_MIN}-{YEAR_MAX}")
-info_cols[2].metric("Grid points", f"{data[['Latitude','Longitude']].drop_duplicates().shape[0]:,}")
-info_cols[3].metric("Source", run_metadata.get("Source Dataset", "-"))
+info_cols[0].metric("Scenarios shown", f"{len(selected_labels)} of {len(scenarios)}")
+info_cols[1].metric("Combined period", f"{YEAR_MIN}-{YEAR_MAX}")
+info_cols[2].metric(
+    "Grid points",
+    f"{primary.data[['Latitude', 'Longitude']].drop_duplicates().shape[0]:,}")
+info_cols[3].metric("Source", primary.run_metadata.get("Source Dataset", "-"))
+st.caption("Showing: " + ", ".join(be.scenario_display_name(l) for l in selected_labels))
 
 with st.expander("ℹ️ About this dataset"):
-    st.write(f"**Source dataset:** {run_metadata.get('Source Dataset', '-')}")
-    st.write(f"**Spatial resolution:** {run_metadata.get('Spatial Resolution', '-')}")
-    st.write(f"**Baseline for percentile indices:** {run_metadata.get('Baseline for Percentile Indices', '-')}")
-    st.write(f"**Season restrictions:** {run_metadata.get('Season Restrictions', run_metadata.get('Season Restriction', '-'))}")
-    st.write(f"**Generated on:** {run_metadata.get('Generated On', '-')}")
-    if len(scenarios) > 1:
-        st.write("**All scenarios loaded:** " + ", ".join(sorted(scenarios.keys())))
+    st.write(f"**Source dataset:** {primary.run_metadata.get('Source Dataset', '-')}")
+    st.write(f"**Spatial resolution:** {primary.run_metadata.get('Spatial Resolution', '-')}")
+    st.write(f"**Baseline for percentile indices:** "
+             f"{primary.run_metadata.get('Baseline for Percentile Indices', '-')}")
+    st.write(f"**Season restrictions:** "
+             f"{primary.run_metadata.get('Season Restrictions', primary.run_metadata.get('Season Restriction', '-'))}")
+    st.write(f"**Generated on:** {primary.run_metadata.get('Generated On', '-')}")
+    st.write("**Scenarios loaded:** " + ", ".join(
+        f"{be.scenario_display_name(l)} [{scenarios[l].year_min}-{scenarios[l].year_max}]"
+        for l in all_labels))
     st.dataframe(
         pd.DataFrame(indicator_metadata).T[["Full Name", "Units", "Definition", "Calculation Method"]],
         width="stretch",
     )
 
-spacing_warning = be.check_grid_spacing(data)
-if spacing_warning:
-    st.sidebar.warning(f"[{scenario_label}] {spacing_warning}")
+for label in selected_labels:
+    spacing_warning, n_missing = _scenario_diagnostics_cached(
+        scenarios[label].source_name, scenarios[label].data, mapped)
+    if spacing_warning:
+        st.sidebar.warning(f"[{be.scenario_display_name(label)}] {spacing_warning}")
+    if n_missing:
+        st.sidebar.warning(f"[{be.scenario_display_name(label)}] {n_missing} grid points have no "
+                            "entry in the mapping file - District/State will show as 'Unknown' "
+                            "for these.")
 
-n_missing = be.coverage_gap(data, mapped)
-if n_missing:
-    st.sidebar.warning(f"[{scenario_label}] {n_missing} grid points have no entry in the "
-                        f"mapping file - District/State will show as 'Unknown' for these.")
-
-grid_lookup = _build_grid_lookup_cached(data)
-LAT_BOUNDS = (data["Latitude"].min() - 0.5, data["Latitude"].max() + 0.5)
-LON_BOUNDS = (data["Longitude"].min() - 0.5, data["Longitude"].max() + 0.5)
+grid_lookup = _build_grid_lookup_cached(primary.source_name, primary.data)
+LAT_BOUNDS = (min(sc.data["Latitude"].min() for sc in selected.values()) - 0.5,
+              max(sc.data["Latitude"].max() for sc in selected.values()) + 0.5)
+LON_BOUNDS = (min(sc.data["Longitude"].min() for sc in selected.values()) - 0.5,
+              max(sc.data["Longitude"].max() for sc in selected.values()) + 0.5)
 
 use_cartopy = viz.cartopy_available(lambda: st.session_state.get("cartopy_unreachable", False))
 
@@ -216,16 +353,27 @@ st.subheader("\U0001F4CD Select a grid point")
 
 indicator_groups = viz.group_indicators_by_category(INDICATOR_COLUMNS, indicator_metadata)
 
-defaults_key = f"point_controls::{scenario_label}"
-if defaults_key not in st.session_state:
+# One control state across scenario selections, clamped to whatever is
+# currently valid - toggling a scenario changes the available year span and
+# indicator set, and silently keeping an out-of-range saved value would either
+# crash the widget or plot a window the data does not cover.
+DEFAULTS_KEY = "point_controls"
+if DEFAULTS_KEY not in st.session_state:
     first_category = next(iter(indicator_groups))
-    st.session_state[defaults_key] = dict(
-        lat=28.625, lon=77.125, category=first_category, indicator=indicator_groups[first_category][0],
-        year_range=(YEAR_MIN, YEAR_MAX),
+    st.session_state[DEFAULTS_KEY] = dict(
+        lat=28.625, lon=77.125, category=first_category,
+        indicator=indicator_groups[first_category][0], year_range=(YEAR_MIN, YEAR_MAX),
     )
-saved = st.session_state[defaults_key]
+saved = dict(st.session_state[DEFAULTS_KEY])
+if saved["category"] not in indicator_groups:
+    saved["category"] = next(iter(indicator_groups))
+if saved["indicator"] not in indicator_groups[saved["category"]]:
+    saved["indicator"] = indicator_groups[saved["category"]][0]
+lo_saved, hi_saved = saved["year_range"]
+saved["year_range"] = (max(YEAR_MIN, min(int(lo_saved), YEAR_MAX)),
+                       min(YEAR_MAX, max(int(hi_saved), YEAR_MIN)))
 
-with st.form(f"point_form::{scenario_label}"):
+with st.form("point_form"):
     row1 = st.columns(2)
     lat_in = row1[0].number_input("Latitude", value=float(saved["lat"]), step=0.125, format="%.3f")
     lon_in = row1[1].number_input("Longitude", value=float(saved["lon"]), step=0.125, format="%.3f")
@@ -233,7 +381,7 @@ with st.form(f"point_form::{scenario_label}"):
     row2 = st.columns(2)
     category = row2[0].selectbox(
         "Indicator category", options=list(indicator_groups.keys()),
-        index=list(indicator_groups.keys()).index(saved["category"]) if saved["category"] in indicator_groups else 0,
+        index=list(indicator_groups.keys()).index(saved["category"]),
     )
     category_indicators = indicator_groups[category]
     indicator = row2[1].selectbox(
@@ -242,16 +390,17 @@ with st.form(f"point_form::{scenario_label}"):
         format_func=lambda k: f"{indicator_metadata[k]['Full Name']} [{indicator_metadata[k]['Units']}]",
     )
 
-    year_range = st.slider("Year range", min_value=YEAR_MIN, max_value=YEAR_MAX, value=saved["year_range"])
+    year_range = st.slider("Year range", min_value=YEAR_MIN, max_value=YEAR_MAX,
+                           value=saved["year_range"])
     submitted = st.form_submit_button("\U0001F4CA Plot", type="primary", width="stretch")
 
 if submitted:
-    st.session_state[defaults_key] = dict(
-        lat=lat_in, lon=lon_in, category=category, indicator=indicator, year_range=year_range,
-    )
-ctrl = st.session_state[defaults_key]
-lat_in, lon_in, indicator = ctrl["lat"], ctrl["lon"], ctrl["indicator"]
-y0, y1 = ctrl["year_range"]
+    saved = dict(lat=lat_in, lon=lon_in, category=category, indicator=indicator,
+                 year_range=year_range)
+st.session_state[DEFAULTS_KEY] = saved
+
+lat_in, lon_in, indicator = saved["lat"], saved["lon"], saved["indicator"]
+y0, y1 = saved["year_range"]
 
 if not (LAT_BOUNDS[0] <= lat_in <= LAT_BOUNDS[1] and LON_BOUNDS[0] <= lon_in <= LON_BOUNDS[1]):
     st.error(f"Input ({lat_in}, {lon_in}) is outside the dataset domain "
@@ -260,11 +409,12 @@ if not (LAT_BOUNDS[0] <= lat_in <= LAT_BOUNDS[1] and LON_BOUNDS[0] <= lon_in <= 
     st.stop()
 
 # --------------------------------------------------------------------------
-# Resolve grid point and render
+# Resolve grid point
 # --------------------------------------------------------------------------
 
 m = be.nearest_grid_point(lat_in, lon_in, grid_lookup, admin_lookup)
 meta = indicator_metadata[indicator]
+units = meta["Units"]
 
 st.divider()
 st.subheader(f"\U0001F4CD {m.district}, {m.state}")
@@ -287,34 +437,167 @@ elif m.admin_match == "Unknown":
     st.warning("This grid node has no entry in the mapping file - District/State "
                "attribution is unavailable for it.")
 
-ts = be.point_time_series(data, m.lat, m.lon, indicator, y0, y1)
-n_valid = ts[indicator].notna().sum()
-if n_valid == 0:
-    st.warning(f"**{meta['Full Name']}** is not computable at this location for any year in "
-               f"{y0}-{y1} - see its definition below for the condition that must be met "
-               f"(e.g. a temperature threshold never reached here). Showing the (empty) chart anyway.")
-elif n_valid < len(ts):
-    st.caption(f"Note: {len(ts) - n_valid} of {len(ts)} years are blank for this indicator at this "
-               f"location - see its definition below for when it's not computable (e.g. a temperature "
-               f"threshold never reached).")
+# --------------------------------------------------------------------------
+# Extract the series for every selected scenario
+# --------------------------------------------------------------------------
 
-fig, (ax_ts, ax_map) = viz.make_figure(use_cartopy)
-viz.plot_point_timeseries(
-    ax_ts, ts["Year"].values, ts[indicator].values, meta["Units"], meta["Full Name"],
-    f"{m.district}, {m.state}  -  {scenario_label}", color=viz.get_colormap_line_color(indicator),
-)
+long_df = be.multi_point_series(selected, m.lat, m.lon, indicator, y0, y1)
+split_year = be.splice_year(long_df)
+
+per_scenario_valid = (long_df.assign(ok=long_df["value"].notna())
+                             .groupby("Scenario")["ok"].agg(["sum", "count"])
+                      if not long_df.empty else pd.DataFrame(columns=["sum", "count"]))
+empty_scenarios = [l for l in selected_labels
+                   if l not in per_scenario_valid.index or per_scenario_valid.at[l, "sum"] == 0]
+partial_scenarios = [l for l in selected_labels
+                     if l in per_scenario_valid.index
+                     and 0 < per_scenario_valid.at[l, "sum"] < per_scenario_valid.at[l, "count"]]
+
+if len(empty_scenarios) == len(selected_labels):
+    st.warning(f"**{meta['Full Name']}** is not computable at this location for any year in "
+               f"{y0}-{y1}, in any selected scenario - see its definition below for the "
+               "condition that must be met (e.g. a temperature threshold never reached). "
+               "Showing the (empty) chart anyway.")
+elif empty_scenarios:
+    st.info("No valid years for " + ", ".join(be.scenario_display_name(l) for l in empty_scenarios)
+            + " at this location - those scenarios are absent from the chart.")
+if partial_scenarios:
+    st.caption("Note: some years are blank for "
+               + ", ".join(be.scenario_display_name(l) for l in partial_scenarios)
+               + " at this location - see the indicator definition below for when it is "
+                 "not computable.")
+
+# --------------------------------------------------------------------------
+# Render
+# --------------------------------------------------------------------------
+
+type_cfg = viz.apply_typography(text_scale)   # must precede make_figure()
+fig, (ax_chart, ax_map) = viz.make_figure(use_cartopy, figsize=type_cfg["figsize"])
+
+period_note = None
+trend_note = None
+baseline = None
+
+
+def _incomplete_note(period_table: pd.DataFrame) -> "str | None":
+    """Name the periods whose mean rests on fewer years than the rest, since
+    those bars are hatched on the chart but the reason is not self-evident."""
+    if period_table.empty or period_table["complete"].all():
+        return None
+    incomplete = period_table.loc[~period_table["complete"], "Period"].unique()
+    return ("Hatched bars are periods only partly covered by the data or the selected year "
+            f"range ({', '.join(incomplete)}), so their mean is taken over fewer years "
+            "than the others.")
+
+
+if chart_type == viz.CHART_LINE:
+    trends = viz.plot_multi_timeseries(
+        ax_chart, long_df, units=units, full_name=meta["Full Name"],
+        title=meta["Full Name"], display_name=be.scenario_short_name,
+        show_trend=show_trend, splice_at=split_year,
+    )
+    if show_trend and trends:
+        trend_note = "OLS trend per decade: " + ";  ".join(
+            f"{be.scenario_short_name(l)} {v:+.2f} {units}" for l, v in trends.items())
+elif chart_type == viz.CHART_BARS_ANNUAL:
+    viz.plot_annual_bars(
+        ax_chart, long_df, units=units, full_name=meta["Full Name"],
+        title=meta["Full Name"], display_name=be.scenario_short_name,
+        splice_at=split_year,
+    )
+elif chart_type == viz.CHART_BARS_PERIOD:
+    period_table = be.period_means(long_df, period_len=period_len)
+    viz.plot_period_bars(
+        ax_chart, period_table, units=units, full_name=meta["Full Name"],
+        title=f"{meta['Full Name']} - {period_len}-year means",
+        display_name=be.scenario_short_name, show_spread=show_spread,
+    )
+    period_note = _incomplete_note(period_table)
+    if show_spread:
+        period_note = ((period_note + " ") if period_note else "") + (
+            "Error bars are +/- 1 standard deviation of the annual values within each period "
+            "(interannual variability at this grid node) - not model spread, which a single "
+            "ensemble-mean field cannot provide.")
+else:  # viz.CHART_BARS_ANOMALY
+    baseline = be.historical_baseline(scenarios, m.lat, m.lon, indicator)
+    if baseline is None:
+        viz.empty_panel(
+            ax_chart, meta["Full Name"],
+            "No historical run loaded, or the indicator\nhas no valid historical year here -\n"
+            "change vs baseline is undefined")
+        period_note = ("A change vs baseline needs a historical workbook that has valid values "
+                       "for this indicator at this grid node. "
+                       + ("Load Historical_Master_Indicators.xlsx to enable it."
+                          if not historical_loaded else
+                          "This indicator has no valid historical year at this node."))
+    else:
+        period_table = be.period_means(long_df, period_len=period_len)
+        anomaly_table = be.anomaly_vs_baseline(period_table, baseline, mode=anomaly_mode)
+        viz.plot_anomaly_bars(
+            ax_chart, anomaly_table, units=units, full_name=meta["Full Name"],
+            title=f"{meta['Full Name']} - change vs {baseline.period}",
+            baseline_period=baseline.period, mode=anomaly_mode,
+            display_name=be.scenario_short_name,
+        )
+        incomplete_note = _incomplete_note(anomaly_table)
+        period_note = (f"Baseline: {be.scenario_display_name(baseline.label)} mean over "
+                       f"{baseline.period} at this grid node = {baseline.mean:.3f} {units} "
+                       f"({baseline.n_years} years). The reference period is fixed to the "
+                       "historical run's own span, independent of the year range selected above.")
+        if anomaly_mode == "percent" and anomaly_table["anomaly"].isna().all():
+            period_note += (" Per-cent change is not shown because the baseline is effectively "
+                            "zero here - use the absolute change instead.")
+        if incomplete_note:
+            period_note += " " + incomplete_note
+
 succeeded = viz.plot_point_locator(ax_map, grid_lookup["Latitude"].values, grid_lookup["Longitude"].values,
                                     LAT_BOUNDS, LON_BOUNDS, m.lat, m.lon, lat_in, lon_in, use_cartopy)
 _note_cartopy_result(succeeded)
 
+viz.add_figure_title(fig, f"{m.district}, {m.state}  |  {m.lat:.3f}, {m.lon:.3f}  |  {y0}-{y1}")
 if not _apply_layout(fig):
     st.caption("Note: automatic figure layout was skipped for this selection "
                "(non-finite element in the plot); using the default geometry.")
 st.pyplot(fig)
+png_bytes = _figure_png(fig)
 plt.close(fig)  # Streamlit re-runs the whole script per interaction
 
+if trend_note:
+    st.caption(trend_note)
+if period_note:
+    st.caption(period_note)
+if chart_type in (viz.CHART_LINE, viz.CHART_BARS_ANNUAL) and split_year is not None:
+    st.caption(f"The dashed rule at {split_year} marks where the record changes from the "
+               "observed-forced historical run to scenario-driven projections; they are "
+               "different experiments, not one continuous series."
+               + (" Each scenario's OLS trend is fitted over its own years only, for the "
+                  "same reason." if chart_type == viz.CHART_LINE and show_trend else ""))
 st.caption(f"**Definition:** {meta['Definition']}")
 st.caption(f"**Method:** {meta['Calculation Method']}")
 
+# --------------------------------------------------------------------------
+# Data table and downloads
+# --------------------------------------------------------------------------
+
+present_labels = [l for l in selected_labels if l in set(long_df["Scenario"])] if not long_df.empty else []
+wide = (long_df.pivot_table(index="Year", columns="Scenario", values="value", aggfunc="mean")
+               .reindex(columns=present_labels)
+               .rename(columns=be.scenario_display_name)
+        if present_labels else pd.DataFrame())
+
 with st.expander("\U0001F4C4 Data table for this grid node"):
-    st.dataframe(ts.rename(columns={indicator: meta["Full Name"]}), width="stretch")
+    if wide.empty:
+        st.write("No values to show for this indicator at this grid node.")
+    else:
+        st.caption(f"{meta['Full Name']} [{units}] at {m.lat:.3f}, {m.lon:.3f}")
+        st.dataframe(wide, width="stretch")
+
+dl = st.columns(2)
+if not wide.empty:
+    csv_name = (f"{indicator}_{m.lat:.3f}_{m.lon:.3f}_{y0}-{y1}.csv").replace(" ", "_")
+    dl[0].download_button("⬇️ Download plotted data (CSV)",
+                          data=wide.to_csv().encode("utf-8"),
+                          file_name=csv_name, mime="text/csv", width="stretch")
+dl[1].download_button("⬇️ Download figure (PNG, 300 dpi)", data=png_bytes,
+                      file_name=f"{indicator}_{m.lat:.3f}_{m.lon:.3f}.png",
+                      mime="image/png", width="stretch")
