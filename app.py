@@ -42,7 +42,7 @@ import streamlit as st
 import backend as be
 import viz
 
-st.set_page_config(page_title="Climate Risk Explorer", page_icon="\U0001F321️", layout="wide")
+st.set_page_config(page_title="Climate Risk App", page_icon="\U0001F321️", layout="wide")
 
 # Resolved against the script's own folder rather than the process working
 # directory: `streamlit run` is often launched from elsewhere, and on Streamlit
@@ -61,7 +61,7 @@ MODE_BOTH = "Historical + Projections"
 # so the app has something plottable on first load instead of an empty panel.
 # (28.625 N, 77.125 E is the Delhi cell.) Change these two numbers to open
 # somewhere else.
-DEFAULT_LAT, DEFAULT_LON = 28.625, 77.125
+DEFAULT_LAT, DEFAULT_LON = 17.625, 78.125
 
 # Streamlit's stock sidebar spacing (1rem between blocks, ~6rem of top
 # padding, h2-sized section headers) makes five control groups overflow into a
